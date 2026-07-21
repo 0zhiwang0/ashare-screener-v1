@@ -1,92 +1,97 @@
 from __future__ import annotations
 
+import time
 import pandas as pd
-import akshare as ak
+import requests
+
+
+MARKET_FILTER = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+HOSTS = (
+    "https://82.push2.eastmoney.com",
+    "https://push2.eastmoney.com",
+    "https://33.push2.eastmoney.com",
+)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+    "Accept": "application/json,text/plain,*/*",
+}
 
 
 def _normalize_code(series: pd.Series) -> pd.Series:
     return series.astype(str).str.extract(r"(\d{6})", expand=False).str.zfill(6)
 
 
-def fetch_realtime_market() -> pd.DataFrame:
-    """获取沪深京 A 股实时行情。"""
-    df = ak.stock_zh_a_spot_em()
-    if df is None or df.empty:
-        raise RuntimeError("实时行情接口未返回数据")
+def _fetch_pages(fields: str, sort_field: str, page_size: int = 800) -> list[dict]:
+    """分批抓取并轮换线路，避免云服务器一次拉取全市场时被断开。"""
+    last_error = None
+    for host in HOSTS:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        rows = []
+        try:
+            page = 1
+            while True:
+                response = session.get(
+                    f"{host}/api/qt/clist/get",
+                    params={
+                        "pn": page, "pz": page_size, "po": 1, "np": 1,
+                        "fltt": 2, "invt": 2, "fid": sort_field,
+                        "fs": MARKET_FILTER, "fields": fields,
+                    },
+                    timeout=(6, 20),
+                )
+                response.raise_for_status()
+                data = (response.json().get("data") or {})
+                batch = data.get("diff") or []
+                rows.extend(batch)
+                total = int(data.get("total") or len(rows))
+                if not batch or len(rows) >= total:
+                    return rows
+                page += 1
+                time.sleep(0.15)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+        finally:
+            session.close()
+    raise RuntimeError(f"行情多线路均连接失败：{last_error}")
 
-    rename_map = {
-        "代码": "代码",
-        "名称": "名称",
-        "最新价": "最新价",
-        "涨跌幅": "涨跌幅",
-        "成交量": "成交量",
-        "成交额": "成交额",
-        "振幅": "振幅",
-        "最高": "最高",
-        "最低": "最低",
-        "今开": "今开",
-        "昨收": "昨收",
-        "量比": "量比",
-        "换手率": "换手率",
-        "市盈率-动态": "市盈率_动态",
-        "市净率": "市净率",
-        "总市值": "总市值",
-        "流通市值": "流通市值",
-        "涨速": "涨速",
-        "5分钟涨跌": "五分钟涨跌",
-        "60日涨跌幅": "六十日涨跌幅",
-        "年初至今涨跌幅": "年初至今涨跌幅",
-    }
-    df = df.rename(columns=rename_map)
-    required = ["代码", "名称", "最新价", "涨跌幅", "成交额", "量比", "换手率"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"实时行情字段发生变化，缺少：{missing}")
 
-    df["代码"] = _normalize_code(df["代码"])
+def _to_numeric(df: pd.DataFrame, text_columns: set[str]) -> pd.DataFrame:
     for col in df.columns:
-        if col not in {"代码", "名称"}:
+        if col not in text_columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 
-def fetch_fund_flow_rank(indicator: str = "今日") -> pd.DataFrame:
-    """获取个股资金流排名。AKShare 支持的 indicator 通常包括 今日、3日、5日、10日。"""
-    try:
-        df = ak.stock_individual_fund_flow_rank(indicator=indicator)
-    except TypeError:
-        df = ak.stock_individual_fund_flow_rank(indicator)
-
-    if df is None or df.empty:
-        raise RuntimeError("资金流接口未返回数据")
-
+def fetch_realtime_market() -> pd.DataFrame:
+    rows = _fetch_pages(
+        "f2,f3,f5,f6,f7,f8,f10,f12,f14,f15,f16,f17,f18", "f3"
+    )
+    df = pd.DataFrame(rows).rename(columns={
+        "f12": "代码", "f14": "名称", "f2": "最新价", "f3": "涨跌幅",
+        "f5": "成交量", "f6": "成交额", "f7": "振幅", "f8": "换手率",
+        "f10": "量比", "f15": "最高", "f16": "最低",
+        "f17": "今开", "f18": "昨收",
+    })
+    if df.empty:
+        raise RuntimeError("实时行情接口未返回数据")
+    required = ["代码", "名称", "最新价", "涨跌幅", "成交额", "量比", "换手率"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise RuntimeError(f"实时行情字段发生变化，缺少：{missing}")
     df["代码"] = _normalize_code(df["代码"])
-    rename_candidates = {
-        "主力净流入-净额": "主力净流入_元",
-        "主力净流入-净占比": "主力净流入占比",
-        "今日主力净流入-净额": "主力净流入_元",
-        "今日主力净流入-净占比": "主力净流入占比",
-        "主力净流入": "主力净流入_元",
-        "主力净流入占比": "主力净流入占比",
-    }
-    df = df.rename(columns={k: v for k, v in rename_candidates.items() if k in df.columns})
+    return _to_numeric(df, {"代码", "名称"})
 
-    if "主力净流入_元" not in df.columns:
-        possible = [c for c in df.columns if "主力净流入" in str(c) and ("净额" in str(c) or str(c).endswith("流入"))]
-        if possible:
-            df = df.rename(columns={possible[0]: "主力净流入_元"})
-    if "主力净流入占比" not in df.columns:
-        possible = [c for c in df.columns if "主力净流入" in str(c) and "占比" in str(c)]
-        if possible:
-            df = df.rename(columns={possible[0]: "主力净流入占比"})
 
-    for col in df.columns:
-        if col not in {"代码", "名称", "所属板块"}:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "主力净流入_元" not in df.columns:
-        raise RuntimeError(f"资金流字段发生变化，当前字段：{list(df.columns)}")
-    if "主力净流入占比" not in df.columns:
-        df["主力净流入占比"] = pd.NA
-
+def fetch_fund_flow_rank(indicator: str = "今日") -> pd.DataFrame:
+    rows = _fetch_pages("f12,f14,f62,f184", "f62")
+    df = pd.DataFrame(rows).rename(columns={
+        "f12": "代码", "f62": "主力净流入_元", "f184": "主力净流入占比"
+    })
+    if df.empty:
+        raise RuntimeError("资金流接口未返回数据")
+    df["代码"] = _normalize_code(df["代码"])
+    df = _to_numeric(df, {"代码", "名称"})
     return df[["代码", "主力净流入_元", "主力净流入占比"]].drop_duplicates("代码")
